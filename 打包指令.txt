@@ -1,0 +1,1 @@
+pyinstaller --windowed --onefile --icon=hb.ico --name "微信收藏解析助手" main.py
