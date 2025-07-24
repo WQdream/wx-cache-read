@@ -6,6 +6,11 @@ import sys
 import json
 import datetime
 import logging
+import tempfile
+import shutil
+import glob
+import time
+import subprocess
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                            QLabel, QPushButton, QFileDialog, QLineEdit, 
                            QProgressBar, QMessageBox, QInputDialog, QApplication,
@@ -18,6 +23,7 @@ from PyQt5.QtGui import (QIcon, QFont, QPixmap, QTextCursor, QColor, QStandardIt
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QByteArray
 
 from utils.wechat_parser import WeChatParser
+from utils.archive_parser import ArchiveParser
 from ui.custom_dialog import CustomInputDialog, CustomMessageBox
 
 # 配置日志
@@ -70,6 +76,17 @@ class QTextEditLogger(logging.Handler):
         msg = self.format(record)
         self.widget.append(msg)
         self.widget.moveCursor(QTextCursor.End)
+        
+    def close(self):
+        """安全地关闭日志处理器"""
+        try:
+            # 移除所有日志处理器
+            logger = logging.getLogger()
+            if self in logger.handlers:
+                logger.removeHandler(self)
+            self.widget = None  # 清除对QTextEdit的引用
+        except:
+            pass
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -92,6 +109,44 @@ class MainWindow(QMainWindow):
         
         logger.info("程序启动成功")
         
+    def __del__(self):
+        """析构函数，确保在程序退出时清理所有临时文件"""
+        try:
+            # 先清理日志处理器
+            self.cleanup_logger()
+            
+            # 直接清理临时文件，不记录日志
+            import shutil
+            import glob
+            import tempfile
+            import os
+            
+            # 尝试关闭所有文件句柄
+            if hasattr(self, 'archive_parser_thread') and hasattr(self.archive_parser_thread, 'parser'):
+                parser = self.archive_parser_thread.parser
+                if parser and hasattr(parser, 'file_handles'):
+                    for handle in parser.file_handles:
+                        try:
+                            handle.close()
+                        except:
+                            pass
+            
+            # 清理临时目录
+            temp_dir = tempfile.gettempdir()
+            patterns = ['archive_extract_*', 'safe_archive_*']
+            
+            for pattern in patterns:
+                matching_dirs = glob.glob(os.path.join(temp_dir, pattern))
+                for dir_path in matching_dirs:
+                    if os.path.isdir(dir_path):
+                        try:
+                            shutil.rmtree(dir_path, ignore_errors=True)
+                        except:
+                            pass
+        except:
+            # 捕获所有异常但不处理，避免在析构函数中引发异常
+            pass
+    
     def setup_style(self):
         """设置应用程序样式"""
         self.setStyleSheet("""
@@ -315,7 +370,7 @@ class MainWindow(QMainWindow):
         preview_title.addWidget(self.sort_info_label)
         
         preview_title.addStretch()
-
+        
         # 添加排序按钮
         sort_by_time_btn = QPushButton("按时间排序")
         sort_by_time_btn.setFixedWidth(100)
@@ -338,7 +393,7 @@ class MainWindow(QMainWindow):
             }
         """)
         preview_title.addWidget(sort_by_time_btn)
-
+        
         # 始终显示清除缓存按钮，不管是否设置了自动清除缓存
         clear_cache_btn = QPushButton("清除缓存")
         clear_cache_btn.setFixedWidth(100)
@@ -437,11 +492,39 @@ class MainWindow(QMainWindow):
         btn_layout.setContentsMargins(0, 5, 0, 0)
         btn_layout.setSpacing(20)
         
-        # 解析按钮
-        self.parse_btn = QPushButton("开始解析")
+        # 解析微信缓存按钮
+        self.parse_btn = QPushButton("解析微信缓存")
         self.parse_btn.setMinimumHeight(35)
         self.parse_btn.setFixedWidth(150)
         self.parse_btn.clicked.connect(self.start_parsing)
+        
+        # 选择压缩包按钮
+        self.archive_btn = QPushButton("选择压缩包")
+        self.archive_btn.setMinimumHeight(35)
+        self.archive_btn.setFixedWidth(150)
+        self.archive_btn.clicked.connect(self.select_archive)
+        self.archive_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #5cb85c;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                font-size: 14px;
+                border-radius: 6px;
+                min-height: 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #4cae4c;
+            }
+            QPushButton:pressed {
+                background-color: #3c8b3c;
+            }
+            QPushButton:disabled {
+                background-color: #b0b0b0;
+                color: #e0e0e0;
+            }
+        """)
         
         # 保存按钮
         self.save_btn = QPushButton("保存文件")
@@ -452,13 +535,14 @@ class MainWindow(QMainWindow):
         
         btn_layout.addStretch()
         btn_layout.addWidget(self.parse_btn)
+        btn_layout.addWidget(self.archive_btn)
         btn_layout.addWidget(self.save_btn)
         btn_layout.addStretch()
         
         content_layout.addWidget(btn_widget)
         layout.addWidget(content_frame)
         self.content_stack.addWidget(home_page)
-        
+    
     def create_settings_page(self):
         """创建设置页面"""
         settings_page = QWidget()
@@ -692,9 +776,9 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self.log_text)
         
         # 设置日志处理器
-        log_handler = QTextEditLogger(self.log_text)
-        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logging.getLogger().addHandler(log_handler)
+        self.log_handler = QTextEditLogger(self.log_text)
+        self.log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(self.log_handler)
         
         # 添加一些空间
         content_layout.addSpacing(20)
@@ -747,6 +831,7 @@ class MainWindow(QMainWindow):
         <ul style="font-size: 15px; line-height: 1.6; color: #333333;">
             <li><b>自动检测</b> - 智能识别当前登录微信用户的收藏路径</li>
             <li><b>批量解析</b> - 一键解析微信收藏中的图片和视频资源</li>
+            <li><b>压缩包解析</b> - 支持解析ZIP压缩包中的图片和视频</li>
             <li><b>智能排序</b> - 尽可能保持与微信收藏笔记中相同的图片顺序</li>
             <li><b>预览功能</b> - 直观展示解析出的文件，方便筛选</li>
             <li><b>手动排序</b> - 支持按时间重新排序，调整文件顺序</li>
@@ -757,16 +842,27 @@ class MainWindow(QMainWindow):
         
         <h3 style="color: #4d8bf0; margin-top: 25px;">使用步骤</h3>
         <ol style="font-size: 15px; line-height: 1.6; color: #333333;">
-            <li>在<b>设置</b>页面配置微信缓存路径（可点击"自动检测"按钮）</li>
-            <li>设置输出保存路径，选择文件保存的位置</li>
-            <li>选择是否在保存后自动清除缓存</li>
-            <li>保存设置后，返回<b>主页</b></li>
-            <li>点击"开始解析"按钮，解析缓存中的文件</li>
-            <li>在预览列表中查看解析出的文件</li>
-            <li>点击"保存文件"按钮将文件保存到指定位置</li>
-            <li>输入自定义文件夹名称（留空则自动使用数字命名）</li>
-            <li>等待保存完成</li>
-            <li>如需清除缓存，可点击"清除缓存"按钮</li>
+            <li><b>解析微信收藏</b>：</li>
+            <ul style="font-size: 14px; line-height: 1.5; margin-left: 20px; margin-bottom: 15px;">
+                <li>在<b>设置</b>页面配置微信缓存路径（可点击"自动检测"按钮）</li>
+                <li>设置输出保存路径，选择文件保存的位置</li>
+                <li>选择是否在保存后自动清除缓存</li>
+                <li>保存设置后，返回<b>主页</b></li>
+                <li>点击"解析微信缓存"按钮，解析缓存中的文件</li>
+            </ul>
+            <li><b>解析压缩包</b>：</li>
+            <ul style="font-size: 14px; line-height: 1.5; margin-left: 20px; margin-bottom: 15px;">
+                <li>点击"选择压缩包"按钮，选择要解析的ZIP压缩包</li>
+                <li>程序会自动解压并解析压缩包中的图片和视频文件</li>
+            </ul>
+            <li><b>保存文件</b>：</li>
+            <ul style="font-size: 14px; line-height: 1.5; margin-left: 20px; margin-bottom: 15px;">
+                <li>在预览列表中查看解析出的文件</li>
+                <li>点击"保存文件"按钮将文件保存到指定位置</li>
+                <li>输入自定义文件夹名称（留空则自动使用数字命名）</li>
+                <li>等待保存完成</li>
+                <li>如需清除缓存，可点击"清除缓存"按钮</li>
+            </ul>
         </ol>
         
         <h3 style="color: #4d8bf0; margin-top: 25px;">🎯 图片排序功能</h3>
@@ -798,7 +894,14 @@ class MainWindow(QMainWindow):
         - C:\\Users\\用户名\\Documents\\WeChat Files\\微信号\\FileStorage\\Fav
         </p>
         
-        <p style="font-size: 15px; font-weight: bold; color: #333333;">2. 图片顺序是如何确定的？</p>
+        <p style="font-size: 15px; font-weight: bold; color: #333333;">2. 支持哪些压缩包格式？</p>
+        <p style="font-size: 14px; line-height: 1.5; color: #333333; margin-left: 20px;">
+        目前支持的压缩包格式为：<br>
+        - ZIP (.zip)<br>
+        如需解析其他格式的压缩包，请先将其转换为ZIP格式。
+        </p>
+        
+        <p style="font-size: 15px; font-weight: bold; color: #333333;">3. 图片顺序是如何确定的？</p>
         <p style="font-size: 14px; line-height: 1.5; color: #333333; margin-left: 20px;">
         软件会尝试多种方式来保持与微信收藏笔记中相同的图片顺序：<br>
         - <b style="color: #5cb85c;">数据库排序（最佳）</b>：从微信数据库中获取原始顺序信息<br>
@@ -807,13 +910,13 @@ class MainWindow(QMainWindow):
         解析完成后，状态栏会显示当前使用的排序方式。如果顺序不理想，可以点击"按时间排序"按钮重新排序。
         </p>
         
-        <p style="font-size: 15px; font-weight: bold; color: #333333;">3. 为什么有些文件无法解析？</p>
+        <p style="font-size: 15px; font-weight: bold; color: #333333;">4. 为什么有些文件无法解析？</p>
         <p style="font-size: 14px; line-height: 1.5; color: #333333; margin-left: 20px;">
         目前支持解析的文件类型包括：jpg、jpeg、png、gif、bmp、webp、mp4、mov、avi、mkv、wmv、flv。<br>
         其他类型的文件可能无法正确解析和预览。
         </p>
         
-        <p style="font-size: 15px; font-weight: bold; color: #333333;">4. 清除缓存会删除哪些文件？</p>
+        <p style="font-size: 15px; font-weight: bold; color: #333333;">5. 清除缓存会删除哪些文件？</p>
         <p style="font-size: 14px; line-height: 1.5; color: #333333; margin-left: 20px;">
         清除缓存只会删除微信缓存路径下的图片和视频文件，不会影响微信的正常使用。<br>
         建议在确认文件已成功保存后再清除缓存。
@@ -826,6 +929,14 @@ class MainWindow(QMainWindow):
         
         <h3 style="color: #4d8bf0; margin-top: 25px;">更新日志</h3>
         <p style="font-size: 14px; line-height: 1.5; color: #333333;">
+        <b>v1.3.0 (2025年8月)</b><br>
+        ✨ 新增压缩包解析功能，支持ZIP格式<br>
+        ✨ 优化界面布局，改进按钮命名和位置<br>
+        🔧 改进文件保存逻辑，更好地处理压缩包中的文件<br>
+        🐛 修复多个稳定性问题<br>
+        </p>
+        
+        <p style="font-size: 14px; line-height: 1.5; color: #333333;">
         <b>v1.2.0 (2025年7月)</b><br>
         ✨ 新增智能图片排序功能，尽可能保持与微信收藏笔记中相同的顺序<br>
         ✨ 新增手动排序功能，支持按时间重新排序<br>
@@ -836,9 +947,9 @@ class MainWindow(QMainWindow):
         </p>
         
         <p style="font-size: 14px; line-height: 1.6; color: #333333; margin-top: 30px; text-align: center;">
-        版本：1.2.0<br>
+        版本：1.3.0<br>
         开发者：小新<br>
-        最后更新：2025年7月
+        最后更新：2025年8月
         </p>
         """
         
@@ -903,9 +1014,9 @@ class MainWindow(QMainWindow):
         logger.info("设置已保存")
     
     def start_parsing(self):
-        """开始解析微信收藏"""
+        """开始解析"""
+        # 获取缓存路径
         cache_path = self.config.get("cache_path", "")
-        
         if not cache_path:
             CustomMessageBox.warning(self, "警告", "请先在设置页面配置微信缓存路径")
             self.menu_list.setCurrentRow(1)  # 切换到设置页面
@@ -918,32 +1029,32 @@ class MainWindow(QMainWindow):
         
         # 清空预览列表
         self.preview_list.clear()
-        # 禁用保存按钮
+        
+        # 禁用按钮，防止重复点击
+        self.parse_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
-        # 重置进度条
+        if hasattr(self, 'archive_btn'):
+            self.archive_btn.setEnabled(False)
+        
+        # 重置进度条和排序信息
         self.progress_bar.setValue(0)
+        self.sort_info_label.setText("排序: 等待解析...")
+        self.sort_info_label.setStyleSheet("font-size: 12px; color: #666666; margin-left: 10px;")
         
         # 创建解析线程
-        try:
-            self.parser_thread = ParserThread(cache_path, None, preview_only=True)
-            self.parser_thread.progress_updated.connect(self.update_progress)
-            self.parser_thread.status_updated.connect(self.update_status)
-            self.parser_thread.error_occurred.connect(self.show_error)
-            self.parser_thread.finished.connect(self.parsing_finished)
-            self.parser_thread.file_found.connect(self.add_file_to_preview)
-            
-            # 禁用按钮
-            self.parse_btn.setEnabled(False)
-            self.status_label.setText("正在解析中...")
-            
-            # 启动线程
-            self.parser_thread.start()
-            logger.info("解析线程已启动")
-            
-        except Exception as e:
-            CustomMessageBox.critical(self, "错误", f"启动解析线程失败: {str(e)}")
-            logger.error(f"启动解析线程失败: {str(e)}")
-            
+        self.parser_thread = ParserThread(cache_path, None, preview_only=True)
+        
+        # 连接信号
+        self.parser_thread.progress_updated.connect(self.update_progress)
+        self.parser_thread.status_updated.connect(self.update_status)
+        self.parser_thread.error_occurred.connect(self.show_error)
+        self.parser_thread.file_found.connect(self.add_file_to_preview)
+        self.parser_thread.finished.connect(self.parsing_finished)
+        
+        # 启动线程
+        self.status_label.setText("正在解析微信收藏...")
+        self.parser_thread.start()
+    
     def parsing_finished(self):
         """解析完成"""
         self.parse_btn.setEnabled(True)
@@ -985,13 +1096,35 @@ class MainWindow(QMainWindow):
         """保存完成"""
         self.parse_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
+        self.archive_btn.setEnabled(True)  # 确保压缩包按钮也被重新启用
         self.status_label.setText("文件保存完成")
-        CustomMessageBox.information(self, "完成", "文件保存完成！")
-        logger.info("保存完成")
+        
+        # 显示保存位置
+        try:
+            if hasattr(self, 'save_thread') and hasattr(self.save_thread, 'save_folder'):
+                save_path = self.save_thread.save_folder
+                if os.path.exists(save_path):
+                    # 获取保存文件夹中的文件数量
+                    file_count = len([name for name in os.listdir(save_path) if os.path.isfile(os.path.join(save_path, name))])
+                    success_msg = f"文件已保存到: {save_path}\n共保存了 {file_count} 个文件"
+                    CustomMessageBox.information(self, "完成", success_msg)
+                    logger.info(f"保存完成，位置: {save_path}，文件数: {file_count}")
+                else:
+                    CustomMessageBox.information(self, "完成", "文件保存完成！")
+                    logger.info("保存完成，但保存路径不存在")
+            else:
+                CustomMessageBox.information(self, "完成", "文件保存完成！")
+                logger.info("保存完成，但无法获取保存路径信息")
+        except Exception as e:
+            CustomMessageBox.information(self, "完成", "文件保存完成！")
+            logger.error(f"获取保存路径信息时出错: {str(e)}")
         
         # 如果配置了自动清除缓存，则在保存完成后清除缓存
         if self.config.get("auto_clear_cache", False):
             self.clear_cache(auto_mode=True)
+        # 否则，如果是压缩包解析，只清理压缩包临时文件
+        elif hasattr(self, 'archive_parser_thread') and hasattr(self.archive_parser_thread, 'parser'):
+            self.clear_temp_archives()
     
     def add_file_to_preview(self, file_info):
         """将文件添加到预览列表，显示图片预览"""
@@ -1007,15 +1140,44 @@ class MainWindow(QMainWindow):
             
             # 图片文件预览
             if file_ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
-                pixmap = QPixmap(file_path)
-                if not pixmap.isNull():
-                    pixmap = pixmap.scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    item.setIcon(QIcon(pixmap))
-                    # 只显示文件名，不显示类型标识
-                    item.setText(file_name)
-                else:
-                    # 如果无法加载图片，使用默认文本
+                try:
+                    # 使用多种方法尝试加载图片
+                    pixmap = None
+                    
+                    # 方法1: 直接使用QPixmap加载
+                    pixmap = QPixmap(file_path)
+                    if pixmap.isNull():
+                        # 方法2: 使用QImage加载
+                        image = QImage(file_path)
+                        if not image.isNull():
+                            pixmap = QPixmap.fromImage(image)
+                    
+                    # 如果仍然无法加载，尝试读取文件内容后加载
+                    if pixmap is None or pixmap.isNull():
+                        try:
+                            # 方法3: 读取文件内容后加载
+                            with open(file_path, 'rb') as f:
+                                image_data = f.read()
+                                image = QImage()
+                                if image.loadFromData(image_data):
+                                    pixmap = QPixmap.fromImage(image)
+                        except Exception as e:
+                            logger.error(f"无法通过文件内容加载图片: {str(e)}")
+                    
+                    # 如果成功加载了图片
+                    if pixmap and not pixmap.isNull():
+                        pixmap = pixmap.scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        item.setIcon(QIcon(pixmap))
+                        item.setText(file_name)
+                        logger.info(f"成功加载图片预览: {file_name}")
+                    else:
+                        # 所有方法都失败，使用默认文本
+                        item.setText(f"{file_name}\n[图片加载失败]")
+                        logger.warning(f"无法加载图片预览: {file_path}")
+                except Exception as e:
+                    # 捕获任何加载图片时的异常
                     item.setText(f"{file_name}\n[图片]")
+                    logger.error(f"加载图片预览时出错: {str(e)}")
             # 视频文件预览
             elif file_ext in ['.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv']:
                 item.setText(f"{file_name}\n[视频]")
@@ -1034,11 +1196,12 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"添加预览时出错: {str(e)}")
             # 如果出错，仍然添加一个简单的项目
-            simple_item = QListWidgetItem(file_info['name'])
-            simple_item.setData(Qt.UserRole, file_info)
-            self.preview_list.addItem(simple_item)
-
-            
+            try:
+                simple_item = QListWidgetItem(file_info['name'])
+                simple_item.setData(Qt.UserRole, file_info)
+                self.preview_list.addItem(simple_item)
+            except Exception as e2:
+                logger.error(f"添加简单预览也失败: {str(e2)}")
     
     def save_parsed_files(self):
         """保存已解析的文件"""
@@ -1054,12 +1217,17 @@ class MainWindow(QMainWindow):
             return
             
         # 检查输出路径是否存在
+        logger.info(f"输出路径: {output_path}")
+        logger.info(f"输出路径是否存在: {os.path.exists(output_path)}")
+        logger.info(f"输出路径是否为绝对路径: {os.path.isabs(output_path)}")
+        
         if not os.path.exists(output_path):
             try:
                 os.makedirs(output_path)
                 logger.info(f"创建输出路径: {output_path}")
             except Exception as e:
                 CustomMessageBox.critical(self, "错误", f"无法创建输出路径: {str(e)}")
+                logger.error(f"无法创建输出路径: {str(e)}")
                 return
         
         # 获取用户输入的文件夹名称或使用递增数字
@@ -1073,6 +1241,7 @@ class MainWindow(QMainWindow):
         # 创建当前日期的文件夹
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         date_folder = os.path.join(output_path, today)
+        logger.info(f"日期文件夹路径: {date_folder}")
         
         # 如果用户输入为空，使用自动递增的数字
         if not folder_name.strip():
@@ -1090,6 +1259,7 @@ class MainWindow(QMainWindow):
         
         # 确定最终保存路径
         save_folder = os.path.join(date_folder, folder_name)
+        logger.info(f"最终保存路径: {save_folder}")
         
         # 如果文件夹已存在，询问用户
         if os.path.exists(save_folder):
@@ -1115,6 +1285,7 @@ class MainWindow(QMainWindow):
                 logger.info(f"创建日期文件夹: {date_folder}")
         except Exception as e:
             CustomMessageBox.critical(self, "错误", f"无法创建日期文件夹: {str(e)}")
+            logger.error(f"无法创建日期文件夹: {str(e)}")
             return
         
         # 创建用户命名的文件夹（如果不存在）
@@ -1124,18 +1295,57 @@ class MainWindow(QMainWindow):
                 logger.info(f"创建保存文件夹: {save_folder}")
         except Exception as e:
             CustomMessageBox.critical(self, "错误", f"无法创建保存文件夹: {str(e)}")
+            logger.error(f"无法创建保存文件夹: {str(e)}")
             return
+        
+        # 测试保存目录是否可写
+        try:
+            test_file = os.path.join(save_folder, "test_write.txt")
+            with open(test_file, 'w') as f:
+                f.write("Test write permission")
+            
+            if os.path.exists(test_file):
+                os.remove(test_file)
+                logger.info("保存目录写入测试成功")
+            else:
+                logger.error("保存目录写入测试失败")
+                CustomMessageBox.critical(self, "错误", "无法在保存目录创建文件，请检查权限")
+                return
+        except Exception as e:
+            logger.error(f"测试保存目录写入权限失败: {str(e)}")
+            CustomMessageBox.critical(self, "错误", f"测试保存目录写入权限失败: {str(e)}")
+            return
+        
+        # 获取所有文件信息
+        files_to_save = []
+        for i in range(self.preview_list.count()):
+            item = self.preview_list.item(i)
+            file_info = item.data(Qt.UserRole)
+            files_to_save.append(file_info)
+        
+        # 检查文件路径是否存在
+        for i, file_info in enumerate(files_to_save[:5]):  # 只检查前5个
+            file_path = file_info['path']
+            logger.info(f"文件{i+1}路径: {file_path}")
+            logger.info(f"文件{i+1}是否存在: {os.path.exists(file_path)}")
+            if os.path.exists(file_path):
+                try:
+                    size = os.path.getsize(file_path)
+                    logger.info(f"文件{i+1}大小: {size} 字节")
+                except Exception as e:
+                    logger.error(f"获取文件{i+1}大小失败: {str(e)}")
         
         # 创建保存线程
         try:
-            # 获取所有文件信息
-            files_to_save = []
-            for i in range(self.preview_list.count()):
-                item = self.preview_list.item(i)
-                file_info = item.data(Qt.UserRole)
-                files_to_save.append(file_info)
+            logger.info(f"创建保存线程，文件数量: {len(files_to_save)}, 保存路径: {save_folder}")
             
-            self.save_thread = SaveThread(files_to_save, save_folder)
+            # 如果是压缩包解析，传递解析器对象引用，防止文件句柄被关闭
+            archive_parser = None
+            if hasattr(self, 'archive_parser_thread') and hasattr(self.archive_parser_thread, 'parser'):
+                archive_parser = self.archive_parser_thread.parser
+                logger.info("检测到压缩包解析器，将传递给保存线程")
+                
+            self.save_thread = SaveThread(files_to_save, save_folder, archive_parser)
             self.save_thread.progress_updated.connect(self.update_progress)
             self.save_thread.status_updated.connect(self.update_status)
             self.save_thread.error_occurred.connect(self.show_error)
@@ -1151,7 +1361,6 @@ class MainWindow(QMainWindow):
             self.save_thread.start()
             logger.info("保存线程已启动")
             
-            # 不再切换到日志页面
         except Exception as e:
             CustomMessageBox.critical(self, "错误", f"启动保存线程失败: {str(e)}")
             logger.error(f"启动保存线程失败: {str(e)}")
@@ -1226,13 +1435,128 @@ class MainWindow(QMainWindow):
         # 否则返回最大数字+1
         return str(max(number_folders) + 1)
 
+    def force_close_handles(self):
+        """强制关闭所有文件句柄"""
+        try:
+            # 如果存在archive_parser_thread，关闭其parser的文件句柄
+            if hasattr(self, 'archive_parser_thread') and hasattr(self.archive_parser_thread, 'parser'):
+                parser = self.archive_parser_thread.parser
+                if parser and hasattr(parser, 'file_handles'):
+                    logger.info(f"关闭压缩包解析器的 {len(parser.file_handles)} 个文件句柄")
+                    for handle in parser.file_handles:
+                        try:
+                            handle.close()
+                        except:
+                            pass
+                    parser.file_handles = []
+            
+            # 如果存在save_thread，关闭其archive_parser的文件句柄
+            if hasattr(self, 'save_thread') and hasattr(self.save_thread, 'archive_parser'):
+                parser = self.save_thread.archive_parser
+                if parser and hasattr(parser, 'file_handles'):
+                    logger.info(f"关闭保存线程的压缩包解析器的 {len(parser.file_handles)} 个文件句柄")
+                    for handle in parser.file_handles:
+                        try:
+                            handle.close()
+                        except:
+                            pass
+                    parser.file_handles = []
+        except Exception as e:
+            logger.error(f"强制关闭文件句柄时出错: {str(e)}")
+
+    def clear_temp_archives(self):
+        """清理临时目录中的压缩包解析缓存"""
+        try:
+            # 先强制关闭所有文件句柄
+            self.force_close_handles()
+            
+            # 确保选择压缩包按钮可用
+            self.archive_btn.setEnabled(True)
+            
+            import shutil
+            import glob
+            import tempfile
+            import time
+            import subprocess
+            
+            temp_dir = tempfile.gettempdir()
+            logger.info(f"清理临时目录中的压缩包缓存: {temp_dir}")
+            
+            # 查找匹配模式的目录
+            patterns = ['archive_extract_*', 'safe_archive_*']
+            
+            for pattern in patterns:
+                matching_dirs = glob.glob(os.path.join(temp_dir, pattern))
+                logger.info(f"找到 {len(matching_dirs)} 个匹配 '{pattern}' 的临时目录")
+                
+                for dir_path in matching_dirs:
+                    if os.path.isdir(dir_path):
+                        try:
+                            logger.info(f"尝试删除临时目录: {dir_path}")
+                            
+                            # 尝试关闭所有可能打开的文件句柄
+                            try:
+                                for root, _, files in os.walk(dir_path):
+                                    for file in files:
+                                        file_path = os.path.join(root, file)
+                                        try:
+                                            # 尝试打开并立即关闭文件，释放可能的句柄
+                                            with open(file_path, 'rb'):
+                                                pass
+                                        except:
+                                            pass
+                            except:
+                                pass
+                            
+                            # 第一次尝试删除
+                            shutil.rmtree(dir_path, ignore_errors=True)
+                            
+                            # 检查目录是否还存在
+                            if os.path.exists(dir_path):
+                                logger.warning(f"第一次删除失败，尝试强制删除: {dir_path}")
+                                
+                                # 在Windows上使用rd命令强制删除
+                                if os.name == 'nt':
+                                    try:
+                                        # 使用rd /s /q命令强制删除目录
+                                        subprocess.run(['rd', '/s', '/q', dir_path], 
+                                                      shell=True, 
+                                                      stdout=subprocess.PIPE, 
+                                                      stderr=subprocess.PIPE)
+                                    except:
+                                        pass
+                                
+                                # 等待一小段时间
+                                time.sleep(0.5)
+                                
+                                # 再次尝试Python方式删除
+                                if os.path.exists(dir_path):
+                                    try:
+                                        shutil.rmtree(dir_path, ignore_errors=True)
+                                    except:
+                                        pass
+                                
+                                # 最后检查是否删除成功
+                                if os.path.exists(dir_path):
+                                    logger.error(f"无法删除临时目录，可能被其他进程占用: {dir_path}")
+                                else:
+                                    logger.info(f"临时目录成功删除: {dir_path}")
+                            else:
+                                logger.info(f"临时目录成功删除: {dir_path}")
+                        except Exception as e:
+                            logger.error(f"删除临时目录失败: {dir_path}, 错误: {str(e)}")
+            
+            logger.info("临时目录清理完成")
+        except Exception as e:
+            logger.error(f"清理临时目录时出错: {str(e)}")
+
     def clear_cache(self, auto_mode=False):
         """清除缓存"""
         # 如果不是自动模式，则显示确认对话框
         if not auto_mode:
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("清除缓存")
-            msg_box.setText("确定要清除所有缓存吗？这将删除微信缓存中的图片和视频，并清空预览。")
+            msg_box.setText("确定要清除所有缓存吗？这将删除微信缓存中的图片和视频，以及压缩包解析产生的临时文件，并清空预览。")
             msg_box.setIcon(QMessageBox.Question)
             
             # 只添加"是"和"否"按钮
@@ -1290,10 +1614,19 @@ class MainWindow(QMainWindow):
         self.preview_list.clear()
         self.save_btn.setEnabled(False)
         
+        # 重新启用选择压缩包按钮
+        self.archive_btn.setEnabled(True)
+        
         # 重置进度条和排序信息
         self.progress_bar.setValue(0)
         self.sort_info_label.setText("排序: 等待解析...")
         self.sort_info_label.setStyleSheet("font-size: 12px; color: #666666; margin-left: 10px;")
+        
+        # 先强制关闭所有文件句柄
+        self.force_close_handles()
+        
+        # 清除压缩包解析产生的临时文件
+        self.clear_temp_archives()
         
         # 清除微信缓存文件
         cache_path = self.config.get("cache_path", "")
@@ -1420,6 +1753,95 @@ class MainWindow(QMainWindow):
             CustomMessageBox.critical(self, "错误", f"排序失败: {str(e)}")
             logger.error(f"排序失败: {str(e)}")
 
+    def select_archive(self):
+        """选择压缩包文件并开始解析"""
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择压缩包文件", "", "ZIP压缩包 (*.zip);;所有文件 (*)")
+        if file_path:
+            logger.info(f"已选择压缩包文件: {file_path}")
+            
+            # 清空预览列表
+            self.preview_list.clear()
+            # 禁用保存按钮
+            self.save_btn.setEnabled(False)
+            # 重置进度条
+            self.progress_bar.setValue(0)
+            
+            # 创建解析线程
+            try:
+                self.archive_parser_thread = ArchiveParserThread(file_path, None, preview_only=True)
+                self.archive_parser_thread.progress_updated.connect(self.update_progress)
+                self.archive_parser_thread.status_updated.connect(self.update_status)
+                self.archive_parser_thread.error_occurred.connect(self.show_error)
+                self.archive_parser_thread.finished.connect(self.archive_parsing_finished)
+                self.archive_parser_thread.file_found.connect(self.add_file_to_preview)
+                
+                # 禁用按钮
+                self.parse_btn.setEnabled(False)
+                self.archive_btn.setEnabled(False)
+                self.status_label.setText("正在解析压缩包...")
+                
+                # 启动线程
+                self.archive_parser_thread.start()
+                logger.info("压缩包解析线程已启动")
+                
+            except Exception as e:
+                CustomMessageBox.critical(self, "错误", f"启动压缩包解析线程失败: {str(e)}")
+                logger.error(f"启动压缩包解析线程失败: {str(e)}")
+            
+    def archive_parsing_finished(self):
+        """压缩包解析完成"""
+        self.parse_btn.setEnabled(True)
+        self.archive_btn.setEnabled(True)
+        # 如果有文件被解析，启用保存按钮
+        if self.preview_list.count() > 0:
+            self.save_btn.setEnabled(True)
+            
+            self.status_label.setText(f"压缩包解析完成，找到 {self.preview_list.count()} 个文件")
+            self.sort_info_label.setText("排序: 按资源名称数字顺序")
+            self.sort_info_label.setStyleSheet("font-size: 12px; color: #5cb85c; margin-left: 10px; font-weight: bold;")
+        else:
+            self.status_label.setText("压缩包解析完成，未找到文件")
+            self.sort_info_label.setText("排序: 无文件")
+        logger.info("压缩包解析完成")
+
+    def cleanup_logger(self):
+        """安全地关闭日志处理器"""
+        try:
+            # 关闭日志处理器
+            if hasattr(self, 'log_handler') and self.log_handler:
+                self.log_handler.close()
+                self.log_handler = None
+                
+            # 移除所有日志处理器
+            root_logger = logging.getLogger()
+            for handler in list(root_logger.handlers):
+                try:
+                    handler.close()
+                    root_logger.removeHandler(handler)
+                except:
+                    pass
+        except:
+            pass
+            
+    def closeEvent(self, event):
+        """窗口关闭事件"""
+        try:
+            # 清理日志处理器
+            self.cleanup_logger()
+            
+            # 清理临时文件
+            self.force_close_handles()
+            self.clear_temp_archives()
+            
+            # 保存配置
+            self.save_config()
+        except:
+            pass
+        
+        # 接受关闭事件
+        event.accept()
+
+
 
 class ParserThread(QThread):
     """解析线程"""
@@ -1427,6 +1849,7 @@ class ParserThread(QThread):
     status_updated = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     file_found = pyqtSignal(dict)
+    finished = pyqtSignal()  # 添加finished信号
     
     def __init__(self, cache_path, save_folder, preview_only=False):
         super().__init__()
@@ -1449,6 +1872,7 @@ class ParserThread(QThread):
             if total_files == 0:
                 self.status_updated.emit("未找到可解析的文件")
                 self.error_occurred.emit("未找到可解析的文件，请检查微信缓存路径是否正确")
+                self.finished.emit()  # 确保发出finished信号
                 return
             
             self.status_updated.emit(f"找到 {total_files} 个文件，开始解析...")
@@ -1475,11 +1899,91 @@ class ParserThread(QThread):
             else:
                 self.status_updated.emit(f"解析完成，已保存 {saved_count}/{total_files} 个文件")
             
+            # 发出完成信号
+            self.finished.emit()
+            
         except Exception as e:
             import traceback
             error_msg = f"解析出错: {str(e)}\n{traceback.format_exc()}"
             self.error_occurred.emit(error_msg)
             logger.error(error_msg)
+            
+            # 确保在出错时也发出完成信号
+            self.finished.emit()
+
+
+class ArchiveParserThread(QThread):
+    """压缩包解析线程"""
+    progress_updated = pyqtSignal(int)
+    status_updated = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+    file_found = pyqtSignal(dict)
+    finished = pyqtSignal()  # 添加finished信号
+    
+    def __init__(self, archive_path, save_folder, preview_only=False):
+        super().__init__()
+        self.archive_path = archive_path
+        self.save_folder = save_folder
+        self.preview_only = preview_only
+        self.parsed_files = []
+        self.parser = None  # 保存解析器对象的引用
+    
+    def run(self):
+        """执行解析任务"""
+        try:
+            # 初始化解析器
+            self.status_updated.emit("正在初始化压缩包解析器...")
+            
+            # 导入解析器
+            from utils.archive_parser import ArchiveParser
+            
+            self.parser = ArchiveParser(self.archive_path)
+            
+            # 获取文件总数
+            self.status_updated.emit("正在解压并获取文件列表...")
+            total_files = self.parser.get_total_files()
+            
+            if total_files == 0:
+                self.status_updated.emit("未找到可解析的文件")
+                self.error_occurred.emit("未在压缩包中找到图片或视频文件")
+                self.finished.emit()  # 确保发出finished信号
+                return
+            
+            self.status_updated.emit(f"找到 {total_files} 个文件，开始解析...")
+            
+            # 解析文件
+            saved_count = 0
+            for i, file_info in enumerate(self.parser.parse_archive()):
+                progress = int((i + 1) / total_files * 100)
+                self.progress_updated.emit(progress)
+                
+                if self.preview_only:
+                    self.status_updated.emit(f"正在解析: {file_info['name']} ({i+1}/{total_files})")
+                    # 发送文件信息信号
+                    self.file_found.emit(file_info)
+                    self.parsed_files.append(file_info)
+                else:
+                    self.status_updated.emit(f"正在保存: {file_info['name']} ({i+1}/{total_files})")
+                    # 保存文件
+                    if self.parser.save_file(file_info, self.save_folder):
+                        saved_count += 1
+            
+            if self.preview_only:
+                self.status_updated.emit(f"解析完成，已找到 {len(self.parsed_files)} 个文件")
+            else:
+                self.status_updated.emit(f"解析完成，已保存 {saved_count}/{total_files} 个文件")
+            
+            # 发出完成信号
+            self.finished.emit()
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"解析压缩包出错: {str(e)}\n{traceback.format_exc()}"
+            self.error_occurred.emit(error_msg)
+            logger.error(error_msg)
+            
+            # 确保在出错时也发出完成信号
+            self.finished.emit()
 
 
 class SaveThread(QThread):
@@ -1487,34 +1991,143 @@ class SaveThread(QThread):
     progress_updated = pyqtSignal(int)
     status_updated = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    finished = pyqtSignal()  # 添加finished信号
     
-    def __init__(self, files, save_folder):
+    def __init__(self, files, save_folder, archive_parser=None):
         super().__init__()
         self.files = files
         self.save_folder = save_folder
+        self.archive_parser = archive_parser
         self.cache_path = ""  # 存储缓存路径
-        if files and len(files) > 0:
-            # 从文件路径中提取缓存根目录，而不是使用完整文件路径
-            file_path = files[0]['path']
-            # 查找FileStorage/Fav或者Favorites目录
-            if "FileStorage/Fav" in file_path.replace("\\", "/"):
-                parts = file_path.replace("\\", "/").split("FileStorage/Fav")
-                self.cache_path = parts[0] + "FileStorage/Fav"
-            elif "Favorites" in file_path.replace("\\", "/"):
-                parts = file_path.replace("\\", "/").split("Favorites")
-                self.cache_path = parts[0] + "Favorites"
-            else:
-                # 如果无法找到明确的路径，使用文件所在目录
-                self.cache_path = os.path.dirname(file_path)
+        self.is_archive = False  # 标记是否为压缩包解析的文件
+        self.safe_temp_dir = None  # 安全的临时目录，用于复制临时文件
         
+        if files and len(files) > 0:
+            # 检查是否为压缩包解析的文件
+            file_path = files[0]['path']
+            if "archive_extract_" in file_path.replace("\\", "/"):
+                self.is_archive = True
+                # 对于压缩包解析的文件，创建一个安全的临时目录
+                try:
+                    self.safe_temp_dir = tempfile.mkdtemp(prefix="safe_archive_")
+                    logger.info(f"创建安全临时目录: {self.safe_temp_dir}")
+                except Exception as e:
+                    logger.error(f"创建安全临时目录失败: {str(e)}")
+                    self.safe_temp_dir = None
+                # 不需要特殊处理缓存路径
+                self.cache_path = ""
+            else:
+                # 从文件路径中提取缓存根目录，而不是使用完整文件路径
+                # 查找FileStorage/Fav或者Favorites目录
+                if "FileStorage/Fav" in file_path.replace("\\", "/"):
+                    parts = file_path.replace("\\", "/").split("FileStorage/Fav")
+                    self.cache_path = parts[0] + "FileStorage/Fav"
+                elif "Favorites" in file_path.replace("\\", "/"):
+                    parts = file_path.replace("\\", "/").split("Favorites")
+                    self.cache_path = parts[0] + "Favorites"
+                else:
+                    # 如果无法找到明确的路径，使用文件所在目录
+                    self.cache_path = os.path.dirname(file_path)
+    
+    def __del__(self):
+        """析构函数，清理临时目录"""
+        self.cleanup_temp_dir()
+    
+    def cleanup_temp_dir(self):
+        """清理临时目录"""
+        import shutil
+        import time
+        import subprocess
+        
+        if self.safe_temp_dir and os.path.exists(self.safe_temp_dir):
+            try:
+                logger.info(f"清理SaveThread的安全临时目录: {self.safe_temp_dir}")
+                
+                # 尝试关闭所有可能打开的文件句柄
+                try:
+                    for root, _, files in os.walk(self.safe_temp_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            try:
+                                # 尝试打开并立即关闭文件，释放可能的句柄
+                                with open(file_path, 'rb'):
+                                    pass
+                            except:
+                                pass
+                except:
+                    pass
+                
+                # 第一次尝试删除
+                shutil.rmtree(self.safe_temp_dir, ignore_errors=True)
+                
+                # 检查目录是否还存在
+                if os.path.exists(self.safe_temp_dir):
+                    logger.warning(f"第一次删除失败，尝试强制删除: {self.safe_temp_dir}")
+                    
+                    # 在Windows上使用rd命令强制删除
+                    if os.name == 'nt':
+                        try:
+                            # 使用rd /s /q命令强制删除目录
+                            subprocess.run(['rd', '/s', '/q', self.safe_temp_dir], 
+                                          shell=True, 
+                                          stdout=subprocess.PIPE, 
+                                          stderr=subprocess.PIPE)
+                        except:
+                            pass
+                    
+                    # 等待一小段时间
+                    time.sleep(0.5)
+                    
+                    # 再次尝试Python方式删除
+                    if os.path.exists(self.safe_temp_dir):
+                        try:
+                            shutil.rmtree(self.safe_temp_dir, ignore_errors=True)
+                        except:
+                            pass
+                    
+                    # 最后检查是否删除成功
+                    if os.path.exists(self.safe_temp_dir):
+                        logger.error(f"无法删除临时目录，可能被其他进程占用: {self.safe_temp_dir}")
+                    else:
+                        logger.info(f"临时目录成功删除: {self.safe_temp_dir}")
+                    
+                self.safe_temp_dir = None
+            except Exception as e:
+                logger.error(f"清理SaveThread临时目录失败: {self.safe_temp_dir}, 错误: {str(e)}")
+    
     def run(self):
         """执行保存任务"""
         try:
-            # 如果没有缓存路径，直接复制文件方式保存
-            if not self.cache_path:
-                self.save_files_directly()
-                return
+            # 如果是压缩包文件，先复制到安全的临时目录
+            if self.is_archive and self.safe_temp_dir:
+                self.status_updated.emit("正在准备文件...")
+                self.copy_to_safe_temp_dir()
+            
+            # 如果是压缩包文件或者没有缓存路径，直接复制文件方式保存
+            if self.is_archive or not self.cache_path:
+                # 如果有压缩包解析器对象，使用它的文件句柄
+                if self.archive_parser:
+                    logger.info("使用压缩包解析器的文件句柄进行保存")
+                    self.save_files_with_archive_parser()
+                else:
+                    self.save_files_directly()
                 
+                # 关闭所有文件句柄
+                if self.archive_parser and hasattr(self.archive_parser, 'file_handles'):
+                    logger.info(f"关闭 {len(self.archive_parser.file_handles)} 个文件句柄")
+                    for handle in self.archive_parser.file_handles:
+                        try:
+                            handle.close()
+                        except:
+                            pass
+                    self.archive_parser.file_handles = []
+                
+                # 保存完成后清理临时目录
+                self.cleanup_temp_dir()
+                # 发出完成信号
+                self.finished.emit()
+                return
+            
             # 初始化解析器 - 传入缓存路径而不是文件路径
             self.status_updated.emit("正在初始化...")
             try:
@@ -1525,14 +2138,34 @@ class SaveThread(QThread):
                 self.status_updated.emit(f"初始化解析器失败，使用直接复制方式: {str(e)}")
                 self.save_files_directly()
             
+            # 保存完成后清理临时目录
+            self.cleanup_temp_dir()
+            # 发出完成信号
+            self.finished.emit()
+            
         except Exception as e:
             import traceback
             error_msg = f"保存出错: {str(e)}\n{traceback.format_exc()}"
             self.error_occurred.emit(error_msg)
             logger.error(error_msg)
             
-    def save_files_with_parser(self, parser):
-        """使用解析器保存文件"""
+            # 关闭所有文件句柄
+            if self.archive_parser and hasattr(self.archive_parser, 'file_handles'):
+                logger.info(f"错误处理中关闭 {len(self.archive_parser.file_handles)} 个文件句柄")
+                for handle in self.archive_parser.file_handles:
+                    try:
+                        handle.close()
+                    except:
+                        pass
+                self.archive_parser.file_handles = []
+            
+            # 发生错误时也要清理临时目录
+            self.cleanup_temp_dir()
+            # 确保在出错时也发出完成信号
+            self.finished.emit()
+    
+    def save_files_with_archive_parser(self):
+        """使用压缩包解析器保存文件"""
         total_files = len(self.files)
         if total_files == 0:
             self.status_updated.emit("没有可保存的文件")
@@ -1540,11 +2173,423 @@ class SaveThread(QThread):
         
         self.status_updated.emit(f"开始保存 {total_files} 个文件...")
         
+        # 详细记录保存路径信息
+        logger.info(f"保存目录: {self.save_folder}")
+        logger.info(f"保存目录是否存在: {os.path.exists(self.save_folder)}")
+        logger.info(f"保存目录是否为绝对路径: {os.path.isabs(self.save_folder)}")
+        
+        # 确保保存目录存在
+        try:
+            os.makedirs(self.save_folder, exist_ok=True)
+            logger.info(f"确保保存目录存在: {self.save_folder}")
+        except Exception as e:
+            error_msg = f"无法创建保存目录: {str(e)}"
+            self.error_occurred.emit(error_msg)
+            logger.error(error_msg)
+            return
+        
         # 计算序号的位数，确保排序正确
         num_digits = len(str(total_files))
         
         # 保存文件
         saved_count = 0
+        failed_count = 0
+        
+        # 记录所有文件的信息
+        logger.info("准备保存的文件列表:")
+        for i, file_info in enumerate(self.files[:5]):  # 只记录前5个文件
+            logger.info(f"文件{i+1}: 名称={file_info['name']}, 路径={file_info['path']}, 存在={os.path.exists(file_info['path'])}")
+            if os.path.exists(file_info['path']):
+                try:
+                    size = os.path.getsize(file_info['path'])
+                    logger.info(f"文件{i+1}大小: {size} 字节")
+                except Exception as e:
+                    logger.error(f"获取文件{i+1}大小失败: {str(e)}")
+        
+        # 逐个保存文件
+        for i, file_info in enumerate(self.files):
+            # 进度更新
+            progress = int((i + 1) / total_files * 100)
+            self.progress_updated.emit(progress)
+            
+            file_path = file_info['path']
+            file_name = file_info['name']
+            
+            self.status_updated.emit(f"正在保存: {file_name} ({i+1}/{total_files})")
+            
+            # 检查源文件是否存在
+            if not os.path.exists(file_path):
+                logger.error(f"源文件不存在: {file_path}")
+                failed_count += 1
+                continue
+            
+            try:
+                # 创建目标文件名
+                sequence_number = str(i + 1).zfill(num_digits)
+                target_filename = f"{sequence_number}_{file_name}"
+                target_path = os.path.join(self.save_folder, target_filename)
+                
+                logger.info(f"尝试保存文件: {file_path} -> {target_path}")
+                
+                # 使用压缩包解析器中的文件句柄读取文件内容
+                file_data = None
+                for j, handle in enumerate(self.archive_parser.file_handles):
+                    try:
+                        handle.seek(0)
+                        handle_path = handle.name
+                        if handle_path == file_path:
+                            file_data = handle.read()
+                            logger.info(f"从文件句柄{j}读取文件内容成功，大小: {len(file_data)} 字节")
+                            break
+                    except Exception as e:
+                        logger.error(f"从文件句柄{j}读取文件内容失败: {str(e)}")
+                
+                # 如果无法从文件句柄读取，尝试直接读取文件
+                if file_data is None:
+                    with open(file_path, 'rb') as src_file:
+                        file_data = src_file.read()
+                        logger.info(f"直接从文件读取内容成功，大小: {len(file_data)} 字节")
+                
+                # 写入目标文件
+                with open(target_path, 'wb') as dst_file:
+                    dst_file.write(file_data)
+                    logger.info(f"已写入目标文件")
+                
+                # 验证文件是否成功保存
+                if os.path.exists(target_path):
+                    saved_size = os.path.getsize(target_path)
+                    logger.info(f"目标文件存在，大小: {saved_size} 字节")
+                    
+                    if saved_size > 0:
+                        saved_count += 1
+                        logger.info(f"文件保存成功: {target_filename}")
+                    else:
+                        logger.error(f"目标文件大小为0: {target_path}")
+                        failed_count += 1
+                else:
+                    logger.error(f"目标文件不存在: {target_path}")
+                    failed_count += 1
+                    
+            except Exception as e:
+                logger.error(f"保存文件时出错: {str(e)}")
+                failed_count += 1
+        
+        # 验证保存结果
+        try:
+            saved_files = [f for f in os.listdir(self.save_folder) if os.path.isfile(os.path.join(self.save_folder, f))]
+            logger.info(f"保存目录中的文件数量: {len(saved_files)}")
+            
+            if len(saved_files) > 0:
+                logger.info(f"保存目录中的前5个文件: {saved_files[:5]}")
+            else:
+                logger.error("保存目录中没有文件")
+        except Exception as e:
+            logger.error(f"验证保存结果时出错: {str(e)}")
+        
+        # 输出最终结果
+        if failed_count > 0:
+            message = f"保存完成，已保存 {saved_count}/{total_files} 个文件，失败 {failed_count} 个"
+            self.status_updated.emit(message)
+            logger.warning(message)
+            self.error_occurred.emit(f"有 {failed_count} 个文件保存失败，请查看日志获取详细信息")
+        else:
+            message = f"保存完成，已保存 {saved_count}/{total_files} 个文件"
+            self.status_updated.emit(message)
+            logger.info(message)
+    
+    def copy_to_safe_temp_dir(self):
+        """将临时文件复制到安全的临时目录"""
+        if not self.safe_temp_dir:
+            logger.error("安全临时目录未创建，无法复制文件")
+            return
+            
+        total_files = len(self.files)
+        if total_files == 0:
+            return
+            
+        logger.info(f"开始将 {total_files} 个文件复制到安全临时目录: {self.safe_temp_dir}")
+        
+        # 复制文件并更新路径
+        copied_count = 0
+        new_files = []
+        
+        # 记录源文件信息
+        logger.info("源文件信息:")
+        for i, file_info in enumerate(self.files[:5]):  # 只记录前5个文件
+            file_path = file_info['path']
+            logger.info(f"源文件{i+1}: 路径={file_path}, 存在={os.path.exists(file_path)}")
+            if os.path.exists(file_path):
+                try:
+                    size = os.path.getsize(file_path)
+                    logger.info(f"源文件{i+1}大小: {size} 字节")
+                except Exception as e:
+                    logger.error(f"获取源文件{i+1}大小失败: {str(e)}")
+        
+        for i, file_info in enumerate(self.files):
+            progress = int((i + 1) / total_files * 50)  # 最多占总进度的50%
+            self.progress_updated.emit(progress)
+            
+            old_path = file_info['path']
+            file_name = file_info['name']
+            
+            # 确保源文件存在
+            if not os.path.exists(old_path):
+                logger.error(f"源文件不存在，无法复制: {old_path}")
+                continue
+            
+            # 创建新路径
+            new_path = os.path.join(self.safe_temp_dir, file_name)
+            logger.info(f"尝试复制文件: {old_path} -> {new_path}")
+            
+            try:
+                # 直接读取和写入文件内容
+                with open(old_path, 'rb') as src_file:
+                    file_content = src_file.read()
+                    logger.info(f"已读取源文件，大小: {len(file_content)} 字节")
+                    
+                    with open(new_path, 'wb') as dst_file:
+                        dst_file.write(file_content)
+                        logger.info(f"已写入目标文件")
+                
+                # 验证文件是否成功复制
+                if os.path.exists(new_path):
+                    copied_size = os.path.getsize(new_path)
+                    logger.info(f"复制的文件存在，大小: {copied_size} 字节")
+                    
+                    if copied_size > 0:
+                        # 创建新的文件信息，更新路径
+                        new_file_info = file_info.copy()
+                        new_file_info['path'] = new_path
+                        new_files.append(new_file_info)
+                        copied_count += 1
+                        logger.info(f"成功复制文件到安全目录: {file_name}")
+                    else:
+                        logger.error(f"复制的文件大小为0: {new_path}")
+                else:
+                    logger.error(f"复制的文件不存在: {new_path}")
+            except Exception as e:
+                logger.error(f"复制文件到安全目录时出错: {str(e)}")
+        
+        logger.info(f"已将 {copied_count}/{total_files} 个文件复制到安全临时目录")
+        
+        # 验证复制结果
+        try:
+            copied_files = [f for f in os.listdir(self.safe_temp_dir) if os.path.isfile(os.path.join(self.safe_temp_dir, f))]
+            logger.info(f"安全临时目录中的文件数量: {len(copied_files)}")
+            
+            if len(copied_files) > 0:
+                logger.info(f"安全临时目录中的前5个文件: {copied_files[:5]}")
+            else:
+                logger.error("安全临时目录中没有文件")
+        except Exception as e:
+            logger.error(f"验证复制结果时出错: {str(e)}")
+        
+        # 更新文件列表
+        if copied_count > 0:
+            self.files = new_files
+            logger.info(f"已更新文件列表，现在有 {len(self.files)} 个文件")
+        else:
+            logger.error("没有文件被成功复制，保持原始文件列表")
+    
+    def save_files_directly(self):
+        """直接复制文件保存"""
+        total_files = len(self.files)
+        if total_files == 0:
+            self.status_updated.emit("没有可保存的文件")
+            return
+        
+        self.status_updated.emit(f"开始保存 {total_files} 个文件...")
+        
+        # 详细记录保存路径信息
+        logger.info(f"保存目录: {self.save_folder}")
+        logger.info(f"保存目录是否存在: {os.path.exists(self.save_folder)}")
+        logger.info(f"保存目录是否为绝对路径: {os.path.isabs(self.save_folder)}")
+        
+        # 确保保存目录存在
+        try:
+            os.makedirs(self.save_folder, exist_ok=True)
+            logger.info(f"确保保存目录存在: {self.save_folder}")
+        except Exception as e:
+            error_msg = f"无法创建保存目录: {str(e)}"
+            self.error_occurred.emit(error_msg)
+            logger.error(error_msg)
+            return
+        
+        # 检查保存目录是否可写
+        try:
+            # 创建一个测试文件
+            test_file = os.path.join(self.save_folder, "test_write.txt")
+            with open(test_file, 'w') as f:
+                f.write("Test write permission")
+            
+            # 验证文件是否创建成功
+            if os.path.exists(test_file):
+                logger.info(f"测试文件创建成功: {test_file}")
+                # 删除测试文件
+                os.remove(test_file)
+                logger.info("测试文件已删除")
+            else:
+                logger.error("测试文件创建失败")
+                self.error_occurred.emit("无法在保存目录创建文件，请检查权限")
+                return
+        except Exception as e:
+            logger.error(f"测试写入权限失败: {str(e)}")
+            self.error_occurred.emit(f"测试写入权限失败: {str(e)}")
+            return
+        
+        # 计算序号的位数，确保排序正确
+        num_digits = len(str(total_files))
+        
+        # 保存文件
+        saved_count = 0
+        failed_count = 0
+        
+        # 记录所有文件的信息
+        logger.info("准备保存的文件列表:")
+        for i, file_info in enumerate(self.files[:5]):  # 只记录前5个文件
+            logger.info(f"文件{i+1}: 名称={file_info['name']}, 路径={file_info['path']}, 存在={os.path.exists(file_info['path'])}")
+            if os.path.exists(file_info['path']):
+                try:
+                    size = os.path.getsize(file_info['path'])
+                    logger.info(f"文件{i+1}大小: {size} 字节")
+                except Exception as e:
+                    logger.error(f"获取文件{i+1}大小失败: {str(e)}")
+        
+        # 逐个保存文件
+        for i, file_info in enumerate(self.files):
+            # 进度更新
+            progress = int((i + 1) / total_files * 100)
+            self.progress_updated.emit(progress)
+            
+            file_path = file_info['path']
+            file_name = file_info['name']
+            
+            self.status_updated.emit(f"正在保存: {file_name} ({i+1}/{total_files})")
+            
+            # 检查源文件是否存在
+            if not os.path.exists(file_path):
+                logger.error(f"源文件不存在: {file_path}")
+                failed_count += 1
+                continue
+            
+            try:
+                # 创建目标文件名
+                sequence_number = str(i + 1).zfill(num_digits)
+                target_filename = f"{sequence_number}_{file_name}"
+                target_path = os.path.join(self.save_folder, target_filename)
+                
+                logger.info(f"尝试保存文件: {file_path} -> {target_path}")
+                
+                # 直接使用二进制模式读写文件
+                with open(file_path, 'rb') as src_file:
+                    file_data = src_file.read()
+                    logger.info(f"已读取源文件，大小: {len(file_data)} 字节")
+                    
+                    with open(target_path, 'wb') as dst_file:
+                        dst_file.write(file_data)
+                        logger.info(f"已写入目标文件")
+                
+                # 验证文件是否成功保存
+                if os.path.exists(target_path):
+                    saved_size = os.path.getsize(target_path)
+                    logger.info(f"目标文件存在，大小: {saved_size} 字节")
+                    
+                    if saved_size > 0:
+                        saved_count += 1
+                        logger.info(f"文件保存成功: {target_filename}")
+                    else:
+                        logger.error(f"目标文件大小为0: {target_path}")
+                        failed_count += 1
+                else:
+                    logger.error(f"目标文件不存在: {target_path}")
+                    failed_count += 1
+                    
+            except Exception as e:
+                logger.error(f"保存文件时出错: {str(e)}")
+                failed_count += 1
+        
+        # 验证保存结果
+        try:
+            saved_files = [f for f in os.listdir(self.save_folder) if os.path.isfile(os.path.join(self.save_folder, f))]
+            logger.info(f"保存目录中的文件数量: {len(saved_files)}")
+            
+            if len(saved_files) > 0:
+                logger.info(f"保存目录中的前5个文件: {saved_files[:5]}")
+            else:
+                logger.error("保存目录中没有文件")
+                
+                # 检查目录权限
+                try:
+                    import stat
+                    dir_stat = os.stat(self.save_folder)
+                    dir_mode = stat.filemode(dir_stat.st_mode)
+                    logger.info(f"保存目录权限: {dir_mode}")
+                except Exception as e:
+                    logger.error(f"获取目录权限失败: {str(e)}")
+                
+                # 尝试在保存目录创建一个测试文件
+                try:
+                    test_file = os.path.join(self.save_folder, "final_test.txt")
+                    with open(test_file, 'w') as f:
+                        f.write("Final test")
+                    
+                    if os.path.exists(test_file):
+                        logger.info("最终测试文件创建成功")
+                        os.remove(test_file)
+                    else:
+                        logger.error("最终测试文件创建失败")
+                except Exception as e:
+                    logger.error(f"创建最终测试文件失败: {str(e)}")
+        except Exception as e:
+            logger.error(f"验证保存结果时出错: {str(e)}")
+        
+        # 清理安全临时目录
+        if self.safe_temp_dir and os.path.exists(self.safe_temp_dir):
+            try:
+                shutil.rmtree(self.safe_temp_dir)
+                logger.info(f"已清理安全临时目录: {self.safe_temp_dir}")
+            except Exception as e:
+                logger.error(f"清理安全临时目录失败: {str(e)}")
+        
+        # 输出最终结果
+        if failed_count > 0:
+            message = f"保存完成，已保存 {saved_count}/{total_files} 个文件，失败 {failed_count} 个"
+            self.status_updated.emit(message)
+            logger.warning(message)
+            self.error_occurred.emit(f"有 {failed_count} 个文件保存失败，请查看日志获取详细信息")
+        else:
+            message = f"保存完成，已保存 {saved_count}/{total_files} 个文件"
+            self.status_updated.emit(message)
+            logger.info(message)
+    
+    def get_safe_filename(self, filename):
+        """获取安全的文件名"""
+        # 移除非法字符
+        import re
+        import hashlib
+        safe_name = re.sub(r'[\\/*?:"<>|]', '_', filename)
+        
+        # 确保文件名不为空
+        if not safe_name or safe_name.startswith('.'):
+            safe_name = f"file_{hashlib.md5(filename.encode()).hexdigest()[:8]}{os.path.splitext(filename)[1]}"
+        
+        return safe_name
+
+    def save_files_with_parser(self, parser):
+        """使用解析器保存文件"""
+        total_files = len(self.files)
+        if total_files == 0:
+            self.status_updated.emit("没有可保存的文件")
+            return
+            
+        self.status_updated.emit(f"开始保存 {total_files} 个文件...")
+        
+        # 计算序号的位数，确保排序正确
+        num_digits = len(str(total_files))
+        
+        # 保存文件
+        saved_count = 0
+        failed_count = 0
         for i, file_info in enumerate(self.files):
             progress = int((i + 1) / total_files * 100)
             self.progress_updated.emit(progress)
@@ -1558,72 +2603,15 @@ class SaveThread(QThread):
             # 保存文件
             if parser.save_file_with_sequence(file_info_with_sequence, self.save_folder):
                 saved_count += 1
+            else:
+                failed_count += 1
+                logger.error(f"使用解析器保存文件失败: {file_info['name']}")
         
-        self.status_updated.emit(f"保存完成，已保存 {saved_count}/{total_files} 个文件")
-    
-    def save_files_directly(self):
-        """直接复制文件保存"""
-        total_files = len(self.files)
-        if total_files == 0:
-            self.status_updated.emit("没有可保存的文件")
-            return
-        
-        self.status_updated.emit(f"开始保存 {total_files} 个文件...")
-        
-        # 计算序号的位数，确保排序正确
-        num_digits = len(str(total_files))
-        
-        # 保存文件
-        saved_count = 0
-        for i, file_info in enumerate(self.files):
-            progress = int((i + 1) / total_files * 100)
-            self.progress_updated.emit(progress)
-            
-            file_path = file_info['path']
-            file_name = file_info['name']
-            
-            self.status_updated.emit(f"正在保存: {file_name} ({i+1}/{total_files})")
-            
-            try:
-                # 确保文件名合法
-                safe_name = self.get_safe_filename(file_name)
-                
-                # 添加序号前缀，确保排序正确
-                base_name, ext = os.path.splitext(safe_name)
-                sequence_number = str(i + 1).zfill(num_digits)  # 补零确保排序
-                prefixed_name = f"{sequence_number}_{safe_name}"
-                
-                # 如果文件名已存在，添加额外序号
-                target_path = os.path.join(self.save_folder, prefixed_name)
-                counter = 1
-                
-                while os.path.exists(target_path):
-                    prefixed_name = f"{sequence_number}_{base_name}_{counter}{ext}"
-                    target_path = os.path.join(self.save_folder, prefixed_name)
-                    counter += 1
-                
-                # 复制文件
-                if os.path.exists(file_path):
-                    import shutil
-                    shutil.copy2(file_path, target_path)
-                    saved_count += 1
-                    logger.info(f"保存文件: {file_name} -> {prefixed_name}")
-                else:
-                    logger.warning(f"文件不存在: {file_path}")
-            except Exception as e:
-                logger.error(f"保存文件失败: {str(e)}")
-        
-        self.status_updated.emit(f"保存完成，已保存 {saved_count}/{total_files} 个文件")
-    
-    def get_safe_filename(self, filename):
-        """获取安全的文件名"""
-        # 移除非法字符
-        import re
-        import hashlib
-        safe_name = re.sub(r'[\\/*?:"<>|]', '_', filename)
-        
-        # 确保文件名不为空
-        if not safe_name or safe_name.startswith('.'):
-            safe_name = f"file_{hashlib.md5(filename.encode()).hexdigest()[:8]}{os.path.splitext(filename)[1]}"
-        
-        return safe_name 
+        if failed_count > 0:
+            message = f"保存完成，已保存 {saved_count}/{total_files} 个文件，失败 {failed_count} 个"
+            self.status_updated.emit(message)
+            logger.warning(message)
+        else:
+            message = f"保存完成，已保存 {saved_count}/{total_files} 个文件"
+            self.status_updated.emit(message)
+            logger.info(message)
